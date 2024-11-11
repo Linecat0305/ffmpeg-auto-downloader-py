@@ -1,27 +1,34 @@
-import json
-import subprocess
 import os
-from typing import Dict, List, Optional, Tuple
-import logging
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import argparse
 import re
 import sys
-import requests
-from bs4 import BeautifulSoup
+import tqdm
 import json
+import logging
+import requests
+import argparse
+import subprocess
+from bs4 import BeautifulSoup
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
 
 class StreamDownloader:
-    def __init__(self, json_path: str, max_workers: int = 3):
+    def __init__(self, json_path: str, max_workers: int = 3, video_dir: Optional[str] = None, subtitle_dir: Optional[str] = None):
         """
         初始化下載器
         :param json_path: JSON檔案路徑
         :param max_workers: 最大並行下載數
+        :param video_dir: 影片的自定義下載路徑
+        :param subtitle_dir: 字幕的自定義下載路徑
         """
         self.json_path = json_path
-        self.output_dir = os.path.join(os.path.expanduser('~'), 'Desktop', 'Course')
-        self.subtitle_dir = os.path.join(os.path.expanduser('~'), 'Desktop', 'st.vtt')
+        
+        # 檢查是否有自定義的路徑，否則使用預設的桌面路徑
+        self.output_dir = video_dir or os.path.join(os.path.expanduser('~'), 'Desktop', 'Video')
+        self.subtitle_dir = subtitle_dir or os.path.join(os.path.expanduser('~'), 'Desktop', 'Subtitle')
+        
         self.max_workers = max_workers
         self.setup_logging()
         
@@ -184,42 +191,92 @@ class StreamDownloader:
             self.logger.error(f"找不到檔案: {self.json_path}")
             return []
 
+    def get_total_duration(self, url: str) -> Optional[float]:
+        """
+        使用ffmpeg獲取影片的總時長（秒）
+        :param url: 影片的URL或檔案路徑
+        :return: 總時長（秒），如果失敗則返回 None
+        """
+        try:
+            command = ['ffmpeg', '-i', url]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            stdout, stderr = process.communicate()
+
+            # 在 ffmpeg 輸出中查找總時長
+            match = re.search(r"Duration: (\d+):(\d+):(\d+).(\d+)", stderr)
+            if match:
+                hours, minutes, seconds, _ = map(int, match.groups())
+                total_seconds = hours * 3600 + minutes * 60 + seconds
+                return total_seconds
+            else:
+                self.logger.error(f"無法獲取影片時長: {url}")
+                return None
+        except Exception as e:
+            self.logger.error(f"獲取影片時長時發生錯誤: {str(e)}")
+            return None
+    
     def run_ffmpeg_command(self, command: List[str], task_title: str) -> bool:
         """
-        執行ffmpeg命令並處理輸出
+        執行ffmpeg命令並處理輸出，包含正確的進度顯示
         :param command: ffmpeg命令列表
         :param task_title: 任務標題
         :return: 是否成功
         """
         try:
+            # 獲取影片的總時長
+            total_duration = self.get_total_duration(command[2])  # command[2] 是影片的URL
+            if total_duration is None:
+                self.logger.error(f"無法獲取影片總時長: {task_title}")
+                return False
+
             startupinfo = None
             if sys.platform == 'win32':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
 
+            # 設置 subprocess 的編碼為 utf-8
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 startupinfo=startupinfo,
+                universal_newlines=True,
+                encoding='utf-8',  # 設置編碼
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
 
-            _, stderr_data = process.communicate()
-            return_code = process.wait()
+            # 設定 tqdm 進度條
+            pbar = tqdm.tqdm(total=100, desc=f"下載進度: {task_title}", unit="%", ncols=80, leave=True)
 
+            for stderr_line in process.stderr:
+                stderr_line = stderr_line.strip()
+
+                # 匹配 ffmpeg 輸出的時間進度信息
+                match = re.search(r"time=(\d+):(\d+):(\d+).(\d+)", stderr_line)
+                if match:
+                    hours, minutes, seconds, _ = map(int, match.groups())
+                    current_time_in_seconds = hours * 3600 + minutes * 60 + seconds
+                    
+                    # 計算進度百分比
+                    progress_percentage = (current_time_in_seconds / total_duration) * 100
+                    pbar.n = progress_percentage
+                    pbar.last_print_n = progress_percentage
+                    pbar.refresh()
+
+            pbar.close()
+
+            return_code = process.wait()
             if return_code == 0:
                 self.logger.info(f"下載完成: {task_title}")
                 return True
             else:
-                try:
-                    error_message = stderr_data.decode('utf-8', errors='replace')
-                except:
-                    error_message = str(stderr_data)
-                
                 self.logger.error(f"下載失敗: {task_title}")
-                self.logger.error(f"錯誤訊息: {error_message}")
                 return False
 
         except Exception as e:
@@ -263,6 +320,11 @@ class StreamDownloader:
 
         success = self.run_ffmpeg_command(command, safe_title)
         return task, success
+    
+    def time_str_to_seconds(self, time_str: str) -> float:
+        """將ffmpeg輸出的時間格式轉換成秒數"""
+        h, m, s = map(float, time_str.split(':'))
+        return h * 3600 + m * 60 + s
 
     def run(self):
         """執行所有下載任務（並行處理）"""
@@ -295,17 +357,27 @@ class StreamDownloader:
 def main():
     parser = argparse.ArgumentParser(description='串流下載工具')
     parser.add_argument('--json', type=str, default='download_tasks.json',
-                      help='JSON任務檔案路徑 (預設: download_tasks.json)')
+                        help='JSON任務檔案路徑 (預設: download_tasks.json)')
     parser.add_argument('--workers', type=int, default=3,
-                      help='最大並行下載數 (預設: 3)')
+                        help='最大並行下載數 (預設: 3)')
+    
+    # 新增選項讓使用者可以自定義下載目錄
+    parser.add_argument('--video-dir', type=str, default=None,
+                        help='自定義影片下載路徑 (預設: 桌面的 Video 資料夾)')
+    parser.add_argument('--subtitle-dir', type=str, default=None,
+                        help='自定義字幕下載路徑 (預設: 桌面的 Subtitle 資料夾)')
     
     args = parser.parse_args()
     
+    # 傳遞自定義路徑參數給 StreamDownloader
     downloader = StreamDownloader(
         json_path=args.json,
-        max_workers=args.workers
+        max_workers=args.workers,
+        video_dir=args.video_dir,
+        subtitle_dir=args.subtitle_dir
     )
     downloader.run()
+
 
 if __name__ == "__main__":
     main()
